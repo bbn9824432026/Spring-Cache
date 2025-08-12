@@ -1,0 +1,800 @@
+// =============================================================================
+// 1. BASIC SPRING CACHE CONFIGURATION
+// =============================================================================
+
+@Configuration
+@EnableCaching
+public class CacheConfig {
+
+    @Bean
+    public CacheManager cacheManager() {
+        RedisCacheManager.Builder builder = RedisCacheManager
+            .RedisCacheManagerBuilder
+            .fromConnectionFactory(redisConnectionFactory())
+            .cacheDefaults(cacheConfiguration());
+            
+        return builder.build();
+    }
+
+    @Bean
+    public RedisCacheConfiguration cacheConfiguration() {
+        return RedisCacheConfiguration.defaultCacheConfig()
+            .entryTtl(Duration.ofMinutes(60))
+            .serializeKeysWith(RedisSerializationContext.SerializationPair
+                .fromSerializer(new StringRedisSerializer()))
+            .serializeValuesWith(RedisSerializationContext.SerializationPair
+                .fromSerializer(new GenericJackson2JsonRedisSerializer()));
+    }
+
+    @Bean
+    public RedisConnectionFactory redisConnectionFactory() {
+        LettuceConnectionFactory factory = new LettuceConnectionFactory(
+            new RedisStandaloneConfiguration("localhost", 6379));
+        return factory;
+    }
+}
+
+// =============================================================================
+// 2. CUSTOM CACHE MANAGER WITH MULTIPLE CACHE CONFIGURATIONS
+// =============================================================================
+
+@Configuration
+@EnableCaching
+public class MultiCacheConfig {
+
+    @Bean
+    @Primary
+    public CacheManager cacheManager() {
+        RedisCacheManager.Builder builder = RedisCacheManager
+            .RedisCacheManagerBuilder
+            .fromConnectionFactory(redisConnectionFactory());
+
+        // Default configuration
+        builder.cacheDefaults(defaultCacheConfiguration());
+
+        // Specific cache configurations
+        Map<String, RedisCacheConfiguration> cacheConfigurations = new HashMap<>();
+        cacheConfigurations.put("users", usersCacheConfiguration());
+        cacheConfigurations.put("products", productsCacheConfiguration());
+        cacheConfigurations.put("short-lived", shortLivedCacheConfiguration());
+
+        builder.withInitialCacheConfigurations(cacheConfigurations);
+        return builder.build();
+    }
+
+    private RedisCacheConfiguration defaultCacheConfiguration() {
+        return RedisCacheConfiguration.defaultCacheConfig()
+            .entryTtl(Duration.ofHours(1))
+            .serializeKeysWith(RedisSerializationContext.SerializationPair
+                .fromSerializer(new StringRedisSerializer()))
+            .serializeValuesWith(RedisSerializationContext.SerializationPair
+                .fromSerializer(new GenericJackson2JsonRedisSerializer()));
+    }
+
+    private RedisCacheConfiguration usersCacheConfiguration() {
+        return RedisCacheConfiguration.defaultCacheConfig()
+            .entryTtl(Duration.ofMinutes(30))
+            .disableCachingNullValues()
+            .serializeKeysWith(RedisSerializationContext.SerializationPair
+                .fromSerializer(new StringRedisSerializer()))
+            .serializeValuesWith(RedisSerializationContext.SerializationPair
+                .fromSerializer(new Jackson2JsonRedisSerializer<>(User.class)));
+    }
+
+    private RedisCacheConfiguration productsCacheConfiguration() {
+        return RedisCacheConfiguration.defaultCacheConfig()
+            .entryTtl(Duration.ofHours(6))
+            .serializeKeysWith(RedisSerializationContext.SerializationPair
+                .fromSerializer(new StringRedisSerializer()))
+            .serializeValuesWith(RedisSerializationContext.SerializationPair
+                .fromSerializer(new Jackson2JsonRedisSerializer<>(Product.class)));
+    }
+
+    private RedisCacheConfiguration shortLivedCacheConfiguration() {
+        return RedisCacheConfiguration.defaultCacheConfig()
+            .entryTtl(Duration.ofMinutes(5))
+            .serializeKeysWith(RedisSerializationContext.SerializationPair
+                .fromSerializer(new StringRedisSerializer()))
+            .serializeValuesWith(RedisSerializationContext.SerializationPair
+                .fromSerializer(new GenericJackson2JsonRedisSerializer()));
+    }
+}
+
+// =============================================================================
+// 3. CUSTOM CACHE RESOLVER
+// =============================================================================
+
+@Component
+public class CustomCacheResolver implements CacheResolver {
+
+    private final CacheManager cacheManager;
+
+    public CustomCacheResolver(CacheManager cacheManager) {
+        this.cacheManager = cacheManager;
+    }
+
+    @Override
+    public Collection<? extends Cache> resolveCaches(CacheOperationInvocationContext<?> context) {
+        Collection<Cache> caches = new ArrayList<>();
+        
+        // Resolve cache based on method parameters or other logic
+        String methodName = context.getMethod().getName();
+        String className = context.getTarget().getClass().getSimpleName();
+        
+        if (methodName.contains("User")) {
+            caches.add(cacheManager.getCache("users"));
+        } else if (methodName.contains("Product")) {
+            caches.add(cacheManager.getCache("products"));
+        } else {
+            // Default cache
+            caches.add(cacheManager.getCache("default"));
+        }
+        
+        return caches;
+    }
+}
+
+// Usage with custom resolver
+@Service
+public class UserService {
+    
+    @Cacheable(cacheResolver = "customCacheResolver")
+    public User getUserById(Long id) {
+        // Database call
+        return userRepository.findById(id);
+    }
+}
+
+// =============================================================================
+// 4. CUSTOM KEY GENERATOR
+// =============================================================================
+
+@Component
+public class CustomKeyGenerator implements KeyGenerator {
+
+    @Override
+    public Object generate(Object target, Method method, Object... params) {
+        StringBuilder keyBuilder = new StringBuilder();
+        
+        // Include class name
+        keyBuilder.append(target.getClass().getSimpleName()).append("::");
+        
+        // Include method name
+        keyBuilder.append(method.getName()).append("::");
+        
+        // Include parameters
+        for (Object param : params) {
+            if (param != null) {
+                keyBuilder.append(param.toString()).append("::");
+            } else {
+                keyBuilder.append("null::");
+            }
+        }
+        
+        // Remove trailing "::"
+        String key = keyBuilder.toString();
+        if (key.endsWith("::")) {
+            key = key.substring(0, key.length() - 2);
+        }
+        
+        return key;
+    }
+}
+
+// Usage with custom key generator
+@Service
+public class ProductService {
+    
+    @Cacheable(value = "products", keyGenerator = "customKeyGenerator")
+    public Product getProductByIdAndCategory(Long id, String category) {
+        return productRepository.findByIdAndCategory(id, category);
+    }
+}
+
+// =============================================================================
+// 5. CUSTOM CACHE ERROR HANDLER
+// =============================================================================
+
+@Component
+public class CustomCacheErrorHandler implements CacheErrorHandler {
+
+    private static final Logger logger = LoggerFactory.getLogger(CustomCacheErrorHandler.class);
+
+    @Override
+    public void handleCacheGetError(RuntimeException exception, Cache cache, Object key) {
+        logger.warn("Cache GET error for cache: {} and key: {}", cache.getName(), key, exception);
+        // Could implement fallback logic here
+    }
+
+    @Override
+    public void handleCachePutError(RuntimeException exception, Cache cache, Object key, Object value) {
+        logger.warn("Cache PUT error for cache: {} and key: {}", cache.getName(), key, exception);
+        // Could implement retry logic here
+    }
+
+    @Override
+    public void handleCacheEvictError(RuntimeException exception, Cache cache, Object key) {
+        logger.warn("Cache EVICT error for cache: {} and key: {}", cache.getName(), key, exception);
+    }
+
+    @Override
+    public void handleCacheClearError(RuntimeException exception, Cache cache) {
+        logger.warn("Cache CLEAR error for cache: {}", cache.getName(), exception);
+    }
+}
+
+// Configuration to register error handler
+@Configuration
+@EnableCaching
+public class CacheErrorHandlerConfig implements CachingConfigurer {
+
+    @Override
+    public CacheErrorHandler errorHandler() {
+        return new CustomCacheErrorHandler();
+    }
+}
+
+// =============================================================================
+// 6. CACHE INTERCEPTOR CONFIGURATION
+// =============================================================================
+
+@Configuration
+public class CacheInterceptorConfig {
+
+    @Bean
+    public CacheInterceptor cacheInterceptor(CacheManager cacheManager) {
+        CacheInterceptor interceptor = new CacheInterceptor();
+        interceptor.setCacheManager(cacheManager);
+        interceptor.setKeyGenerator(new CustomKeyGenerator());
+        interceptor.setErrorHandler(new CustomCacheErrorHandler());
+        return interceptor;
+    }
+
+    @Bean
+    public BeanNameAutoProxyCreator createAutoProxyCreator() {
+        BeanNameAutoProxyCreator autoProxyCreator = new BeanNameAutoProxyCreator();
+        autoProxyCreator.setInterceptorNames("cacheInterceptor");
+        autoProxyCreator.setBeanNames("*Service", "*Repository");
+        return autoProxyCreator;
+    }
+}
+
+// =============================================================================
+// 7. CACHE-ASIDE PATTERN EXAMPLES
+// =============================================================================
+
+@Service
+public class UserServiceCacheAside {
+
+    private final UserRepository userRepository;
+    private final CacheManager cacheManager;
+
+    public UserServiceCacheAside(UserRepository userRepository, CacheManager cacheManager) {
+        this.userRepository = userRepository;
+        this.cacheManager = cacheManager;
+    }
+
+    // Read with Cache-Aside
+    public User getUserById(Long id) {
+        Cache cache = cacheManager.getCache("users");
+        Cache.ValueWrapper valueWrapper = cache.get(id);
+        
+        if (valueWrapper != null) {
+            return (User) valueWrapper.get();
+        }
+        
+        // Cache miss - load from database
+        User user = userRepository.findById(id).orElse(null);
+        if (user != null) {
+            cache.put(id, user);
+        }
+        
+        return user;
+    }
+
+    // Write with Cache-Aside (Write-Around)
+    public User updateUser(User user) {
+        User updatedUser = userRepository.save(user);
+        
+        // Evict from cache after update
+        Cache cache = cacheManager.getCache("users");
+        cache.evict(user.getId());
+        
+        return updatedUser;
+    }
+
+    // Write with Cache-Aside (Write-Behind simulation)
+    @CachePut(value = "users", key = "#user.id")
+    public User updateUserWithCachePut(User user) {
+        return userRepository.save(user);
+    }
+}
+
+// Using Spring Cache annotations for Cache-Aside
+@Service
+public class ProductServiceCacheAside {
+
+    private final ProductRepository productRepository;
+
+    public ProductServiceCacheAside(ProductRepository productRepository) {
+        this.productRepository = productRepository;
+    }
+
+    @Cacheable(value = "products", key = "#id")
+    public Product getProductById(Long id) {
+        return productRepository.findById(id).orElse(null);
+    }
+
+    @CachePut(value = "products", key = "#product.id")
+    public Product updateProduct(Product product) {
+        return productRepository.save(product);
+    }
+
+    @CacheEvict(value = "products", key = "#id")
+    public void deleteProduct(Long id) {
+        productRepository.deleteById(id);
+    }
+
+    @CacheEvict(value = "products", allEntries = true)
+    public void clearProductCache() {
+        // This will clear all entries in the products cache
+    }
+}
+
+// =============================================================================
+// 8. TWO-LEVEL CACHING (LOCAL + DISTRIBUTED)
+// =============================================================================
+
+@Configuration
+@EnableCaching
+public class TwoLevelCacheConfig {
+
+    @Bean
+    @Primary
+    public CacheManager compositeCacheManager() {
+        CompositeCacheManager cacheManager = new CompositeCacheManager();
+        cacheManager.setCacheManagers(
+            Arrays.asList(
+                localCacheManager(),    // L1 Cache - Caffeine
+                redisCacheManager()     // L2 Cache - Redis
+            )
+        );
+        cacheManager.setFallbackToNoOpCache(false);
+        return cacheManager;
+    }
+
+    @Bean
+    public CacheManager localCacheManager() {
+        CaffeineCacheManager cacheManager = new CaffeineCacheManager();
+        cacheManager.setCaffeine(Caffeine.newBuilder()
+            .maximumSize(1000)
+            .expireAfterWrite(10, TimeUnit.MINUTES)
+            .recordStats());
+        return cacheManager;
+    }
+
+    @Bean
+    public CacheManager redisCacheManager() {
+        return RedisCacheManager.builder(redisConnectionFactory())
+            .cacheDefaults(RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(Duration.ofHours(1)))
+            .build();
+    }
+}
+
+// Custom Two-Level Cache Implementation
+@Component
+public class TwoLevelCache implements Cache {
+
+    private final Cache localCache;
+    private final Cache distributedCache;
+    private final String name;
+
+    public TwoLevelCache(String name, Cache localCache, Cache distributedCache) {
+        this.name = name;
+        this.localCache = localCache;
+        this.distributedCache = distributedCache;
+    }
+
+    @Override
+    public String getName() {
+        return name;
+    }
+
+    @Override
+    public Object getNativeCache() {
+        return this;
+    }
+
+    @Override
+    public ValueWrapper get(Object key) {
+        // Try L1 cache first
+        ValueWrapper value = localCache.get(key);
+        if (value != null) {
+            return value;
+        }
+
+        // Try L2 cache
+        value = distributedCache.get(key);
+        if (value != null) {
+            // Populate L1 cache
+            localCache.put(key, value.get());
+        }
+
+        return value;
+    }
+
+    @Override
+    public void put(Object key, Object value) {
+        localCache.put(key, value);
+        distributedCache.put(key, value);
+    }
+
+    @Override
+    public void evict(Object key) {
+        localCache.evict(key);
+        distributedCache.evict(key);
+    }
+
+    @Override
+    public void clear() {
+        localCache.clear();
+        distributedCache.clear();
+    }
+
+    // Additional methods for cache synchronization
+    public void evictLocal(Object key) {
+        localCache.evict(key);
+    }
+}
+
+// Cache synchronization with Redis Pub/Sub
+@Component
+public class CacheSynchronization {
+
+    private final RedisTemplate<String, Object> redisTemplate;
+    private final CacheManager localCacheManager;
+
+    public CacheSynchronization(RedisTemplate<String, Object> redisTemplate, 
+                               CacheManager localCacheManager) {
+        this.redisTemplate = redisTemplate;
+        this.localCacheManager = localCacheManager;
+    }
+
+    @EventListener
+    public void handleCacheEvict(CacheEvictEvent event) {
+        // Publish eviction event to other nodes
+        String message = event.getCacheName() + ":" + event.getKey();
+        redisTemplate.convertAndSend("cache-evict", message);
+    }
+
+    @RedisMessageListener
+    public void handleCacheEvictMessage(String message) {
+        String[] parts = message.split(":", 2);
+        if (parts.length == 2) {
+            String cacheName = parts[0];
+            String key = parts[1];
+            
+            Cache cache = localCacheManager.getCache(cacheName);
+            if (cache != null) {
+                cache.evict(key);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// 9. STAMPEDE PROTECTION
+// =============================================================================
+
+@Service
+public class StampedeProtectedService {
+
+    private final ExpensiveService expensiveService;
+
+    public StampedeProtectedService(ExpensiveService expensiveService) {
+        this.expensiveService = expensiveService;
+    }
+
+    // Using sync=true to prevent cache stampede
+    @Cacheable(value = "expensive-operations", key = "#id", sync = true)
+    public ExpensiveData getExpensiveData(Long id) {
+        return expensiveService.loadExpensiveData(id);
+    }
+
+    // Manual stampede protection with Cache.get(key, Callable)
+    public ExpensiveData getExpensiveDataManual(Long id) {
+        Cache cache = cacheManager.getCache("expensive-operations");
+        
+        return cache.get(id, () -> {
+            // This callable will only be executed by one thread
+            return expensiveService.loadExpensiveData(id);
+        });
+    }
+}
+
+// Redis-based distributed locking for stampede protection
+@Service
+public class DistributedStampedeProtection {
+
+    private final RedisTemplate<String, String> redisTemplate;
+    private final ExpensiveService expensiveService;
+    private final CacheManager cacheManager;
+
+    public DistributedStampedeProtection(RedisTemplate<String, String> redisTemplate,
+                                       ExpensiveService expensiveService,
+                                       CacheManager cacheManager) {
+        this.redisTemplate = redisTemplate;
+        this.expensiveService = expensiveService;
+        this.cacheManager = cacheManager;
+    }
+
+    public ExpensiveData getExpensiveDataWithDistributedLock(Long id) {
+        Cache cache = cacheManager.getCache("expensive-operations");
+        Cache.ValueWrapper cachedValue = cache.get(id);
+        
+        if (cachedValue != null) {
+            return (ExpensiveData) cachedValue.get();
+        }
+
+        String lockKey = "lock:expensive-data:" + id;
+        String lockValue = UUID.randomUUID().toString();
+        
+        Boolean acquired = redisTemplate.opsForValue().setIfAbsent(
+            lockKey, lockValue, Duration.ofMinutes(5));
+        
+        if (Boolean.TRUE.equals(acquired)) {
+            try {
+                // Double-check cache after acquiring lock
+                cachedValue = cache.get(id);
+                if (cachedValue != null) {
+                    return (ExpensiveData) cachedValue.get();
+                }
+                
+                // Load data and cache it
+                ExpensiveData data = expensiveService.loadExpensiveData(id);
+                cache.put(id, data);
+                return data;
+                
+            } finally {
+                // Release lock
+                String script = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+                redisTemplate.execute(new DefaultRedisScript<>(script, Long.class), 
+                    Collections.singletonList(lockKey), lockValue);
+            }
+        } else {
+            // Wait and retry or return cached value if available
+            try {
+                Thread.sleep(100);
+                cachedValue = cache.get(id);
+                if (cachedValue != null) {
+                    return (ExpensiveData) cachedValue.get();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            
+            // Fallback to direct database call
+            return expensiveService.loadExpensiveData(id);
+        }
+    }
+}
+
+// =============================================================================
+// 10. METRICS AND INSTRUMENTATION
+// =============================================================================
+
+@Configuration
+public class CacheMetricsConfig {
+
+    @Bean
+    public CacheMetricsCollector cacheMetricsCollector(CacheManager cacheManager, 
+                                                      MeterRegistry meterRegistry) {
+        return new CacheMetricsCollector(cacheManager, meterRegistry);
+    }
+}
+
+@Component
+public class CacheMetricsCollector {
+
+    private final CacheManager cacheManager;
+    private final MeterRegistry meterRegistry;
+
+    public CacheMetricsCollector(CacheManager cacheManager, MeterRegistry meterRegistry) {
+        this.cacheManager = cacheManager;
+        this.meterRegistry = meterRegistry;
+    }
+
+    @PostConstruct
+    public void bindCacheMetrics() {
+        for (String cacheName : cacheManager.getCacheNames()) {
+            Cache cache = cacheManager.getCache(cacheName);
+            if (cache != null) {
+                bindCacheToRegistry(cache);
+            }
+        }
+    }
+
+    private void bindCacheToRegistry(Cache cache) {
+        Object nativeCache = cache.getNativeCache();
+        
+        if (nativeCache instanceof com.github.benmanes.caffeine.cache.Cache) {
+            CaffeineCacheMetrics.monitor(meterRegistry, 
+                (com.github.benmanes.caffeine.cache.Cache<?, ?>) nativeCache, 
+                cache.getName());
+        }
+        // Add other cache implementations as needed
+    }
+}
+
+// Custom cache statistics endpoint
+@RestController
+@RequestMapping("/actuator/cache")
+public class CacheStatsController {
+
+    private final CacheManager cacheManager;
+
+    public CacheStatsController(CacheManager cacheManager) {
+        this.cacheManager = cacheManager;
+    }
+
+    @GetMapping("/stats")
+    public Map<String, Object> getCacheStats() {
+        Map<String, Object> stats = new HashMap<>();
+        
+        for (String cacheName : cacheManager.getCacheNames()) {
+            Cache cache = cacheManager.getCache(cacheName);
+            if (cache != null) {
+                Object nativeCache = cache.getNativeCache();
+                if (nativeCache instanceof com.github.benmanes.caffeine.cache.Cache) {
+                    com.github.benmanes.caffeine.cache.Cache<?, ?> caffeineCache = 
+                        (com.github.benmanes.caffeine.cache.Cache<?, ?>) nativeCache;
+                    
+                    CacheStats cacheStats = caffeineCache.stats();
+                    Map<String, Object> cacheStatsMap = new HashMap<>();
+                    cacheStatsMap.put("hitCount", cacheStats.hitCount());
+                    cacheStatsMap.put("missCount", cacheStats.missCount());
+                    cacheStatsMap.put("hitRate", cacheStats.hitRate());
+                    cacheStatsMap.put("evictionCount", cacheStats.evictionCount());
+                    
+                    stats.put(cacheName, cacheStatsMap);
+                }
+            }
+        }
+        
+        return stats;
+    }
+
+    @PostMapping("/clear/{cacheName}")
+    public ResponseEntity<String> clearCache(@PathVariable String cacheName) {
+        Cache cache = cacheManager.getCache(cacheName);
+        if (cache != null) {
+            cache.clear();
+            return ResponseEntity.ok("Cache " + cacheName + " cleared successfully");
+        }
+        return ResponseEntity.notFound().build();
+    }
+}
+
+// =============================================================================
+// 11. APPLICATION.PROPERTIES CONFIGURATION
+// =============================================================================
+
+/*
+# Redis Configuration
+spring.redis.host=localhost
+spring.redis.port=6379
+spring.redis.password=
+spring.redis.database=0
+spring.redis.timeout=2000ms
+spring.redis.lettuce.pool.max-active=8
+spring.redis.lettuce.pool.max-idle=8
+spring.redis.lettuce.pool.min-idle=0
+
+# Cache Configuration
+spring.cache.type=redis
+spring.cache.redis.time-to-live=3600000
+spring.cache.redis.cache-null-values=false
+spring.cache.redis.key-prefix=myapp::
+spring.cache.redis.use-key-prefix=true
+
+# Caffeine Configuration (for local caching)
+spring.cache.caffeine.spec=maximumSize=1000,expireAfterWrite=600s
+
+# Actuator endpoints
+management.endpoints.web.exposure.include=health,info,metrics,caches
+management.endpoint.caches.enabled=true
+*/
+
+// =============================================================================
+// 12. EXAMPLE ENTITIES AND REPOSITORIES
+// =============================================================================
+
+@Entity
+public class User {
+    @Id
+    private Long id;
+    private String username;
+    private String email;
+    private LocalDateTime createdAt;
+    
+    // Constructors, getters, setters
+}
+
+@Entity
+public class Product {
+    @Id
+    private Long id;
+    private String name;
+    private String category;
+    private BigDecimal price;
+    private LocalDateTime updatedAt;
+    
+    // Constructors, getters, setters
+}
+
+@Repository
+public interface UserRepository extends JpaRepository<User, Long> {
+    Optional<User> findByUsername(String username);
+    List<User> findByEmailContaining(String emailPart);
+}
+
+@Repository
+public interface ProductRepository extends JpaRepository<Product, Long> {
+    List<Product> findByCategory(String category);
+    Optional<Product> findByIdAndCategory(Long id, String category);
+}
+
+// Service classes demonstrating various caching patterns
+@Service
+@Transactional
+public class ComprehensiveUserService {
+
+    private final UserRepository userRepository;
+
+    public ComprehensiveUserService(UserRepository userRepository) {
+        this.userRepository = userRepository;
+    }
+
+    @Cacheable(value = "users", key = "#id")
+    public User getUserById(Long id) {
+        return userRepository.findById(id).orElse(null);
+    }
+
+    @Cacheable(value = "users", key = "#username")
+    public User getUserByUsername(String username) {
+        return userRepository.findByUsername(username).orElse(null);
+    }
+
+    @CachePut(value = "users", key = "#result.id")
+    public User createUser(User user) {
+        return userRepository.save(user);
+    }
+
+    @CachePut(value = "users", key = "#user.id")
+    public User updateUser(User user) {
+        return userRepository.save(user);
+    }
+
+    @CacheEvict(value = "users", key = "#id")
+    public void deleteUser(Long id) {
+        userRepository.deleteById(id);
+    }
+
+    @CacheEvict(value = "users", allEntries = true)
+    public void clearUserCache() {
+        // Clears all entries in users cache
+    }
+
+    // Conditional caching
+    @Cacheable(value = "users", key = "#email", condition = "#email != null && #email.length() > 5")
+    public List<User> getUsersByEmail(String email) {
+        return userRepository.findByEmailContaining(email);
+    }
+
+    // Unless condition (cache unless result is empty)
+    @Cacheable(value = "user-search", key = "#email", unless = "#result.isEmpty()")
+    public List<User> searchUsersByEmail(String email) {
+        return userRepository.findByEmailContaining(email);
+    }
+}
